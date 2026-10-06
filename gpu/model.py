@@ -26,6 +26,10 @@ _SUPPORTED_NK = {(3840, 2560), (2560, 2560), (13824, 2560), (2560, 6912),
                  (4800, 3200), (3200, 3200), (20480, 3200), (3200, 10240),
                  (5120, 27648), (55296, 5120)}
 
+# Batched W2A8 GEMM (this PR): compiled for these M on the 2B-4T shapes.
+_GEMM_M = {2, 4, 8, 16, 32}
+_GEMM_NK = {(3840, 2560), (2560, 2560), (13824, 2560), (2560, 6912)}
+
 def bitnet_int8xint2_linear(input0, input1, s, ws):
     out_shape = list(input0.shape)
     out_shape[-1] = input1.shape[0]
@@ -47,10 +51,22 @@ def bitnet_int8xint2_linear(input0, input1, s, ws):
 
     if M == 1:
         bitnet_lib.bitlinear_int8xint2(*[ctypes.c_void_p(input0.data_ptr()), ctypes.c_void_p(input1.data_ptr()), ctypes.c_void_p(ret.data_ptr()), ctypes.c_void_p(s.data_ptr()), ctypes.c_void_p(ws.data_ptr()), ctypes.c_int(M), ctypes.c_int(N), ctypes.c_int(K), ctypes.c_void_p(stream.cuda_stream)])
+    elif (N, K) in _GEMM_NK and M <= 32:
+        # Batched GEMM: pad M to the next compiled size if needed.
+        MT = next(m for m in (2, 4, 8, 16, 32) if m >= M)
+        if MT == M:
+            bitnet_lib.bitlinear_int8xint2(*[ctypes.c_void_p(input0.data_ptr()), ctypes.c_void_p(input1.data_ptr()), ctypes.c_void_p(ret.data_ptr()), ctypes.c_void_p(s.data_ptr()), ctypes.c_void_p(ws.data_ptr()), ctypes.c_int(M), ctypes.c_int(N), ctypes.c_int(K), ctypes.c_void_p(stream.cuda_stream)])
+        else:
+            pad_in = torch.zeros(MT, K, dtype=input0.dtype, device=input0.device)
+            pad_in[:M] = input0.reshape(M, K)
+            pad_s = torch.ones(MT, dtype=s.dtype, device=s.device)
+            pad_s[:M] = s.reshape(M)
+            pad_out = torch.zeros(MT, N, dtype=torch.bfloat16, device=input0.device)
+            bitnet_lib.bitlinear_int8xint2(*[ctypes.c_void_p(pad_in.data_ptr()), ctypes.c_void_p(input1.data_ptr()), ctypes.c_void_p(pad_out.data_ptr()), ctypes.c_void_p(pad_s.data_ptr()), ctypes.c_void_p(ws.data_ptr()), ctypes.c_int(MT), ctypes.c_int(N), ctypes.c_int(K), ctypes.c_void_p(stream.cuda_stream)])
+            ret.reshape(M, N).copy_(pad_out[:M])
     else:
-        # No batched kernel exists; loop the verified M=1 GEMV per row instead
-        # of returning zeros. s is per-row [M, 1] -- each row needs its own
-        # quantization scale pointer.
+        # Large-batch fallback: loop the verified M=1 GEMV per row.
+        # s is per-row [M, 1] -- each row needs its own scale pointer.
         flat_in = input0.reshape(M, K)
         flat_out = ret.reshape(M, N)
         flat_s = s.reshape(M)
